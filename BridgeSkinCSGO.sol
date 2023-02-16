@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.9;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Burnable.sol";
-import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Royalty.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
@@ -16,53 +16,93 @@ contract BridgeSkinCSGO is
     ERC721Enumerable,
     ERC721URIStorage,
     ERC721Burnable,
-    ERC721Royalty,
     Pausable,
     Ownable
 {
     using ECDSA for bytes32;
     using SafeMath for uint256;
+    using SafeERC20 for IERC20;
 
     string public baseTokenURI = "ipfs://";
     mapping(uint256 => uint8) internal mintedTokens;
-    address public signerAddress = 0x0000000000000000000000000000000000000000;
+    address public signer = 0x0000000000000000000000000000000000000000;
+    uint256 public fee = 1000000000000000;
 
     event Mint(address indexed owner, uint256 indexed tokenID);
     event Withdraw(address indexed owner, uint256 indexed tokenID);
+    event Migrate(address indexed owner, uint256 indexed tokenID);
 
     constructor() ERC721("Bridge Skin CS:GO", "BSCS") {
-        setDefaultRoyalty(msg.sender, 150);
-        signerAddress = msg.sender;
+        signer = msg.sender;
     }
 
     function safeMint(
-        uint256 tokenID,
-        string memory uri,
-        bytes memory sign
+        uint256[] memory tokenID,
+        string[] memory uri,
+        string[] memory salt,
+        bytes[] memory sign
     ) public whenNotPaused {
-        require(mintedTokens[tokenID] == 0, "TOKEN ALREADY MINTED");
-        require(
-            verifyMessage(append(Strings.toHexString(uint160(msg.sender), 20), uri, Strings.toString(tokenID)), sign) == true,
-            "BAD SIGN"
-        );
+        uint256 length = tokenID.length;
+        require(length == uri.length, "Invalid input");
+        require(length == salt.length, "Invalid input");
+        require(length == sign.length, "Invalid input");
 
-        mintedTokens[tokenID] = 1;
+        for (uint256 i = 0; i < length; i++) {
+            require(mintedTokens[tokenID[i]] == 0, "Token already minted");
+            require(
+                verifyMessage(
+                    msg.sender,
+                    tokenID[i],
+                    uri[i],
+                    salt[i],
+                    sign[i]
+                ) == true,
+                "Invalid signature"
+            );
 
-        _safeMint(msg.sender, tokenID);
-        _setTokenURI(tokenID, uri);
+            mintedTokens[tokenID[i]] = 1;
 
-        emit Mint(msg.sender, tokenID);
+            _safeMint(msg.sender, tokenID[i]);
+            _setTokenURI(tokenID[i], uri[i]);
+
+            emit Mint(msg.sender, tokenID[i]);
+        }
     }
 
-    function withdraw(uint256 tokenID) public whenNotPaused {
-        address tokenOwner = ownerOf(tokenID);
-        require(msg.sender == tokenOwner, "YOU ARE NOT THE OWNER");
+    function withdraw(uint256[] memory tokenID) public payable whenNotPaused {
+        require(msg.value >= fee, "Insufficient to cover fees");
 
-        require(mintedTokens[tokenID] == 1, "TOKEN ALREADY BURNED");
+        for (uint256 i = 0; i < tokenID.length; i++) {
+            address tokenOwner = ownerOf(tokenID[i]);
+            require(msg.sender == tokenOwner, "You are not the owner");
 
-        mintedTokens[tokenID] = 2;
-        _burn(tokenID);
-        emit Withdraw(tokenOwner, tokenID);
+            require(mintedTokens[tokenID[i]] == 1, "Token already burned");
+
+            mintedTokens[tokenID[i]] = 2;
+            _burn(tokenID[i]);
+            emit Withdraw(tokenOwner, tokenID[i]);
+        }
+    }
+
+    function migrate(uint256[] memory tokenID) public whenNotPaused {
+        for (uint256 i = 0; i < tokenID.length; i++) {
+            address tokenOwner = ownerOf(tokenID[i]);
+            require(msg.sender == tokenOwner, "You are not the owner");
+
+            require(mintedTokens[tokenID[i]] == 1, "Token already burned");
+
+            mintedTokens[tokenID[i]] = 2;
+            _burn(tokenID[i]);
+            emit Migrate(tokenOwner, tokenID[i]);
+        }
+    }
+
+    function withdrawBalance() external onlyOwner {
+        payable(owner()).transfer(address(this).balance);
+    }
+
+    function withdrawToken(IERC20 token, address to, uint256 amount) external onlyOwner {
+        token.safeTransfer(to, amount);
     }
 
     function _baseURI() internal view virtual override returns (string memory) {
@@ -77,15 +117,12 @@ contract BridgeSkinCSGO is
         return mintedTokens[tokenID];
     }
 
-    function setSignerAddress(address signer) public onlyOwner {
-        signerAddress = signer;
+    function setSigner(address s) public onlyOwner {
+        signer = s;
     }
 
-    function setDefaultRoyalty(address receiver, uint96 feeNumerator)
-        public
-        onlyOwner
-    {
-        _setDefaultRoyalty(receiver, feeNumerator);
+    function setFee(uint256 i) public onlyOwner {
+        fee = i;
     }
 
     function tokensOfOwner(address _owner)
@@ -102,28 +139,17 @@ contract BridgeSkinCSGO is
         return tokensId;
     }
 
-    function verifyMessage(string memory message, bytes memory sign)
-        internal
-        view
-        returns (bool)
-    {
-        bytes memory s = bytes(message);
-        bytes32 m = keccak256(
-            abi.encodePacked(
-                "\x19Ethereum Signed Message:\n",
-                Strings.toString(s.length),
-                s
-            )
-        );
-        return signerAddress == m.recover(sign);
-    }
-
-    function append(string memory a, string memory b, string memory c)
-        internal
-        pure
-        returns (string memory)
-    {
-        return string(abi.encodePacked(a, "/", b, "/", c));
+    function verifyMessage(
+        address addr,
+        uint256 id,
+        string memory uri,
+        string memory salt,
+        bytes memory sign
+    ) internal view returns (bool) {
+        return
+            keccak256(abi.encodePacked(addr, id, uri, salt))
+                .toEthSignedMessageHash()
+                .recover(sign) == signer;
     }
 
     function pause() public onlyOwner {
@@ -137,14 +163,15 @@ contract BridgeSkinCSGO is
     function _beforeTokenTransfer(
         address from,
         address to,
-        uint256 tokenId
+        uint256 tokenId,
+        uint256 batchSize
     ) internal override(ERC721, ERC721Enumerable) whenNotPaused {
-        super._beforeTokenTransfer(from, to, tokenId);
+        super._beforeTokenTransfer(from, to, tokenId, batchSize);
     }
 
     function _burn(uint256 tokenId)
         internal
-        override(ERC721, ERC721URIStorage, ERC721Royalty)
+        override(ERC721, ERC721URIStorage)
     {
         super._burn(tokenId);
     }
@@ -161,7 +188,7 @@ contract BridgeSkinCSGO is
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(ERC721, ERC721Enumerable, ERC721Royalty)
+        override(ERC721, ERC721Enumerable)
         returns (bool)
     {
         return super.supportsInterface(interfaceId);
